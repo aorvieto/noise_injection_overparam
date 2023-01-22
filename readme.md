@@ -1,7 +1,6 @@
 
-## Code for the paper
 ## Explicit Regularization in Overparametrized Models via Noise Injection
-### Antonio Orvieto$^*$, Anant Raj$^*$, Hans Kersting$^*$ and Francis Bach
+### Antonio Orvieto*, Anant Raj*, Hans Kersting* and Francis Bach
 
 ### Accepted at AISTATS 2023
 
