@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+import time
 import torchvision.models as models
 from torchvision import datasets, transforms
 from torchvision.datasets import CIFAR100
@@ -10,8 +11,8 @@ import math
 import numpy as np
 import random
 import matplotlib.pyplot as plt
-from utils import flat_params, compute_jacobian
-from models import CIFARCNN2, CIFARCNN3, MNISTNet1, MNISTNet2, MNISTNet3, CIFARCNN1, vgg11_bn, ResNet34
+from utils import flat_params, compute_jacobian, get_lr
+from models import CIFARCNN2, CIFARCNN3, MNISTNet1, MNISTNet2, MNISTNet3, CIFARCNN1, vgg11_bn, ResNet34, ResNet18
 from datetime import datetime
 from pyhessian import hessian
 import torchvision.transforms as tt
@@ -75,17 +76,30 @@ def train_net(GPU, settings):
 
     elif settings["dataset"]=="CIFAR":
 
+        #data transforms
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ])
+
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ])
+
+
         #data
-        transform = transforms.Compose([transforms.ToTensor(),transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-        train_dataset = torchvision.datasets.CIFAR10(root='./data', download=True, train=True, transform=transform)
-        validation_dataset = torchvision.datasets.CIFAR10(root='./data', download=True, train=False, transform=transform)
+        train_dataset = torchvision.datasets.CIFAR10(root='./data', download=True, train=True, transform=transform_train)
+        validation_dataset = torchvision.datasets.CIFAR10(root='./data', download=True, train=False, transform=transform_test)
         
         #trainloader subset
-        #train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=settings["bs"], shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
-        subset = random.sample(range(train_dataset.data.shape[0]),settings["subset"])
-        sample_ds = torch.utils.data.Subset(train_dataset, subset)
-        sample_sampler = torch.utils.data.RandomSampler(sample_ds)
-        train_loader = torch.utils.data.DataLoader(sample_ds, sampler=sample_sampler, batch_size=settings["bs"], num_workers=8, pin_memory=True, persistent_workers=True)
+        train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=settings["bs"], shuffle=True, num_workers=2, pin_memory=True, persistent_workers=True)
+        #subset = random.sample(range(train_dataset.data.shape[0]),settings["subset"])
+        #sample_ds = torch.utils.data.Subset(train_dataset, subset)
+        #sample_sampler = torch.utils.data.RandomSampler(sample_ds)
+        #train_loader = torch.utils.data.DataLoader(sample_ds, sampler=sample_sampler, batch_size=settings["bs"], num_workers=8, pin_memory=True, persistent_workers=True)
 
         #hessloader subset
         subset = random.sample(range(train_dataset.data.shape[0]),int(settings["subset"]/10))
@@ -103,6 +117,8 @@ def train_net(GPU, settings):
             model = torch.nn.DataParallel(CIFARCNN2(),gpu_ids).cuda()
         elif settings["net"] == "CNN3": 
             model = torch.nn.DataParallel(CIFARCNN3(),gpu_ids).cuda()
+        elif settings["net"] == "CIFAR10Res18":
+            model = torch.nn.DataParallel(ResNet18(),gpu_ids).cuda()
         elif settings["net"] == "CIFAR10Res34":
             model = torch.nn.DataParallel(ResNet34(),gpu_ids).cuda()
 
@@ -140,12 +156,13 @@ def train_net(GPU, settings):
 
     ########### Setup Optimizer ###########   
     if settings["optimizer"]=="SGD":
-        optimizer = torch.optim.SGD(model.parameters(), lr=settings["lr"], momentum=0.9)
+        optimizer = torch.optim.SGD(model.parameters(), lr=settings["lr"],momentum=0.9, weight_decay=5e-4)
     elif settings["optimizer"]=="Adam":
         optimizer = torch.optim.Adam(model.parameters(), lr=settings["lr"])        
     else: print("method not defined!!")
 
     if settings["scheduler"]:
+        #scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[50, 100], gamma=0.1)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, int(settings["epochs"]))
         
     sigma_curr = settings["sigma"]
@@ -167,8 +184,21 @@ def train_net(GPU, settings):
     iter = 0
     
 	########### Training ###########     
-    for epoch in range(settings["epochs"]): 
-        
+    for epoch in range(settings["epochs"]):
+        start_time = time.time()
+        print('epoch #'+str(epoch)+', lr = '+str(get_lr(optimizer)))
+
+        ########### Computing Hessian if last iteration #####
+        hess_train = 0
+        if 0:
+            if epoch==(settings["epochs"]-1):
+                model.eval()
+                optimizer.zero_grad(set_to_none=True)
+                for d in hess_loader:
+                    data, target = d[0].to(device, non_blocking=True),d[1].to(device, non_blocking=True)
+                    hess_train = hess_train+np.sum(hessian(model, criterion, data=(data, target), cuda=True).trace())/len(hess_loader) 
+                optimizer.zero_grad(set_to_none=True)
+
         ########### Saving stats every few epochs ########### 
         if (epoch%settings["rec_step"])==0:
             results["rec_steps"].append(epoch)
@@ -183,14 +213,6 @@ def train_net(GPU, settings):
                 pred = output.data.max(1)[1] # get the index of the max log-probability
                 correct += pred.eq(target.data).cpu().sum()
             accuracy_train = 100. * correct.to(torch.float32) / len(train_loader.dataset)
-
-            #computing stats: hessian
-            hess_train = 0
-            optimizer.zero_grad(set_to_none=True)
-            for d in hess_loader:
-                data, target = d[0].to(device, non_blocking=True),d[1].to(device, non_blocking=True)
-                hess_train = hess_train+np.sum(hessian(model, criterion, data=(data, target), cuda=True).trace())/len(hess_loader) 
-            optimizer.zero_grad(set_to_none=True)
 
             #computing stats: test loss
             test_loss, correct = 0, 0
@@ -224,24 +246,25 @@ def train_net(GPU, settings):
             results["l2_norm"].append(torch.norm(flat_params(model),2).cpu().detach().numpy())
             #results["grad_norm"].append(grad_norm(model).numpy())
 
-            print('Epoch {}: Train L: {:.4f}, TrainAcc: {:.0f}, Test L: {:.4f}, TestAcc: {:.0f} \n'.format(epoch, train_loss, accuracy_train, test_loss, accuracy_test))
+            print('Epoch {}: Train L: {:.4f}, TrainAcc: {:.2f}, Test L: {:.4f}, TestAcc: {:.2f} \n'.format(epoch, train_loss, accuracy_train, test_loss, accuracy_test))
 
         ########### Saving stats every few epochs ########### 
         model.train()
         for batch_idx, (data, target) in enumerate(train_loader):
             ### model perturbation
-            if settings["noise"] != "no":
-                param_copy = []
-                with torch.no_grad():
-                    i=0
-                    for param in model.parameters():
-                        param_copy.append(param.data)
-                        if settings["noise"] == "all":
-                            param.data = param.data + (sigma_curr/math.sqrt(n_groups))*torch.normal(0, 1, size=param.size(),device=device)
-                        elif settings["noise"] == "layer":
-                            if i==(iter%n_groups):
-                                param.data = param.data + sigma_curr*torch.normal(0, 1, size=param.size(),device=device)
-                            i = i+1
+            if epoch<135:
+                if settings["noise"] != "no":
+                    param_copy = []
+                    with torch.no_grad():
+                        i=0
+                        for param in model.parameters():
+                            param_copy.append(param.data)
+                            if settings["noise"] == "all":
+                                param.data = param.data + (sigma_curr/math.sqrt(n_groups))*torch.normal(0, 1, size=param.size(),device=device)
+                            elif settings["noise"] == "layer":
+                                if i==(iter%n_groups):
+                                    param.data = param.data + sigma_curr*torch.normal(0, 1, size=param.size(),device=device)
+                                i = i+1
 
             ### backprop
             data = data.to(device)
@@ -265,6 +288,7 @@ def train_net(GPU, settings):
 
         if settings["scheduler"]:
             scheduler.step()
+        print(time.time()-start_time)
 
     return results
 
@@ -273,119 +297,30 @@ def settings_to_str(settings):
 
 if __name__ == "__main__":
 
-    if 1: 
-        GPU = [6]
-        dataset = "FMNIST"
-        net = "MLP2"
-        subset = 1024
-        rec_step = 1000
+    # example comparing different noise injections to vanilla SGD
 
-        nep = 10000
-        lr1 = 0.005
-        bs = 1024
+    GPU = [2,3]
+    dataset = "CIFAR"
+    subset = 50000
+    nep = 50
+    bs = 128
+    rec_step = 1
+    net = "CIFAR10Res18"
 
-        noise = "no"
+    noise = "no" #layer,all
+    sigma = 0.03
+    lr1 = 0.01
+    settings = {"dataset":dataset, "subset": subset, "net": net, "optimizer":"SGD", "scheduler":True, "noise":noise, "bs":bs, "lr":lr1, "sigma":sigma, "epochs":nep, "rec_step":rec_step}
+    results = train_net(GPU,settings)
+    torch.save(results, 'results/'+settings_to_str(settings)+'.pt') 
 
-        sigma = 0.001
-        settings = {"dataset":dataset, "subset": subset, "net": net, "optimizer":"SGD", "scheduler":False, "noise":noise, "bs":bs, "lr":lr1, "sigma":sigma, "epochs":nep, "rec_step":rec_step}
-        results = train_net(GPU,settings)
-        torch.save(results, 'results/'+settings_to_str(settings)+'.pt')   
+    noise = "layer" #layer,all
+    sigma = 0.03
+    lr1 = 0.01
+    settings = {"dataset":dataset, "subset": subset, "net": net, "optimizer":"SGD", "scheduler":True, "noise":noise, "bs":bs, "lr":lr1, "sigma":sigma, "epochs":nep, "rec_step":rec_step}
+    results = train_net(GPU,settings)
+    torch.save(results, 'results/'+settings_to_str(settings)+'.pt') 
 
-        # sigma = 0.005
-        # settings = {"dataset":dataset, "subset": subset, "net": net, "optimizer":"SGD", "scheduler":False, "noise":noise, "bs":bs, "lr":lr1, "sigma":sigma, "epochs":nep, "rec_step":rec_step}
-        # results = train_net(GPU,settings)
-        # torch.save(results, 'results/'+settings_to_str(settings)+'.pt')   
-
-        # sigma = 0.05
-        # settings = {"dataset":dataset, "subset": subset, "net": net, "optimizer":"SGD", "scheduler":False, "noise":noise, "bs":bs, "lr":lr1, "sigma":sigma, "epochs":nep, "rec_step":rec_step}
-        # results = train_net(GPU,settings)
-        # torch.save(results, 'results/'+settings_to_str(settings)+'.pt')   
-
-    if 0: 
-        GPU = [7]
-        dataset = "CIFAR"
-        subset = 50000
-        nep = 500
-        lr1 = 0.01
-        bs = 128
-        rec_step = 25
-        sigma = 0.05
-        net = "CNN2"
-
-        noise = "no" #layer,all
-        sigma = 0.05
-        lr1 = 0.005
-        settings = {"dataset":dataset, "subset": subset, "net": net, "optimizer":"SGD", "scheduler":True, "noise":noise, "bs":bs, "lr":lr1, "sigma":sigma, "epochs":nep, "rec_step":rec_step}
-        results = train_net(GPU,settings)
-        torch.save(results, 'results/'+settings_to_str(settings)+'.pt') 
-
-        noise = "layer" #layer,all
-        sigma = 0.05
-        lr1 = 0.005
-        settings = {"dataset":dataset, "subset": subset, "net": net, "optimizer":"SGD", "scheduler":True, "noise":noise, "bs":bs, "lr":lr1, "sigma":sigma, "epochs":nep, "rec_step":rec_step}
-        results = train_net(GPU,settings)
-        torch.save(results, 'results/'+settings_to_str(settings)+'.pt')  
-
-        noise = "all" #layer,all
-        sigma = 0.05
-        lr1 = 0.005
-        settings = {"dataset":dataset, "subset": subset, "net": net, "optimizer":"SGD", "scheduler":True, "noise":noise, "bs":bs, "lr":lr1, "sigma":sigma, "epochs":nep, "rec_step":rec_step}
-        results = train_net(GPU,settings)
-        torch.save(results, 'results/'+settings_to_str(settings)+'.pt')  
-
-
-    if 0:
-        GPU = [0,1]
-        dataset = "CIFAR100"
-        subset = 60000
-        nep = 1000
-        lr1 = 0.01
-        bs = 128
-        rec_step = 25
-        sigma = 0.05
-        net = "CIFAR100vgg"
-
-        noise = "layer" #layer,all
-        sigma = 0.5
-        lr1 = 0.001
-        settings = {"dataset":dataset, "subset": subset, "net": net, "optimizer":"Adam", "scheduler":True, "noise":noise, "bs":bs, "lr":lr1, "sigma":sigma, "epochs":nep, "rec_step":rec_step}
-        results = train_net(GPU,settings)
-        torch.save(results, 'results/'+settings_to_str(settings)+'.pt')  
-
-        # noise = "layer" #layer,all
-        # sigma = 1
-        # lr1 = 0.05
-        # settings = {"dataset":dataset, "subset": subset, "net": net, "optimizer":"Adam", "scheduler":True, "noise":noise, "bs":bs, "lr":lr1, "sigma":sigma, "epochs":nep, "rec_step":rec_step}
-        # results = train_net(GPU,settings)
-
-
-        # noise = "layer" #layer,all
-        # sigma = 1
-        # lr1 = 0.05
-        # settings = {"dataset":dataset, "subset": subset, "net": net, "optimizer":"Adam", "scheduler":True, "noise":noise, "bs":bs, "lr":lr1, "sigma":sigma, "epochs":nep, "rec_step":rec_step}
-        # results = train_net(GPU,settings)
-        # torch.save(results, 'results/'+settings_to_str(settings)+'.pt')  
-
-    if 0:
-        GPU = [0]
-        dataset = "CIFAR"
-        subset = 50000
-        nep = 5000
-        lr1 = 0.001
-        bs = 1024
-        rec_step = 1
-        sigma = 0.05
-        net = "CNN2"
-
-        noise = "layer" #layer,all
-        sigma = 0.05
-        settings = {"dataset":dataset, "subset": subset, "net": net, "optimizer":"Adam", "scheduler":True, "noise":noise, "bs":bs, "lr":lr1, "sigma":sigma, "epochs":nep, "rec_step":rec_step}
-        results = train_net(GPU,settings)
-        torch.save(results, 'results/'+settings_to_str(settings)+'.pt')  
-
-        # noise = "all" #layer,all
-        # sigma = 0.05
-        # settings = {"dataset":dataset, "subset": subset, "net": net, "optimizer":"SGD", "scheduler":True, "noise":noise, "bs":bs, "lr":lr1, "sigma":sigma, "epochs":nep, "rec_step":rec_step}
-        # results = train_net(GPU,settings)
-        # torch.save(results, 'results/'+settings_to_str(settings)+'.pt')           
+        
+        
 

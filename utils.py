@@ -17,6 +17,10 @@ def zero_gradients(x):
     if x.grad is not None:
     	x.grad.zero_()
 
+def get_lr(optimizer):
+    for param_group in optimizer.param_groups:
+        return param_group['lr']
+
 def compute_jacobian(inputs, output):
 	"""
 	:param inputs: Batch X Size (e.g. Depth X Width X Height)
